@@ -1,0 +1,228 @@
+---
+title: "GFCR to REEF+"
+subtitle: "Aggregating MERMAID GFCR data for REEF+ platform"
+author: "Iain R. Caldwell"
+date: 05/30/2025
+format: 
+  html: #for website
+    embed-resources: true
+editor: visual
+code-fold: true
+code-summary: "Show the code"
+toc: true
+title-block-banner: "#f0f3f5"
+title-block-banner-color: "black"
+include-after-body: "footer.html"
+---
+
+------------------------------------------------------------------------
+
+## Context - Aggregating GFCR data from MERMAID for REEF+
+
+This code was created to make it easier to export GFCR data from MERMAID ([https://datamermaid.org](https://datamermaid.org/)) and aggregate it to scales that can be used for the REEF+ Impact platform.
+
+------------------------------------------------------------------------
+
+## Getting summary sample event data from MERMAID
+
+The first step is to download all of the current GFCR data from MERMAID. This is done using the mermaidr package (<https://data-mermaid.github.io/mermaidr/>). That package must be installed and its library loaded. The following code also requires other packages - the libraries for those packages are loaded here but this code assumes the packages have already been installed.
+
+```{r}
+#| label: Load packages and export data
+#| warning: false
+rm(list = ls()) #remove past stored objects
+options(scipen = 999) #turn off scientific notation
+
+####  Load packages and libraries ####
+## If this is the first time using mermaidr, install the package through "remotes"
+# install.packages("remotes")
+# remotes::install_github("data-mermaid/mermaidr")
+
+library(mermaidr) #package to download data from datamermaid.org
+library(tidyverse) #package that makes it easier to work with data
+library(openxlsx) #package for saving files as xlsx
+library(DT) #interactive tables
+library(kableExtra) #formatting of tables
+
+#### Get current GFCR data from MERMAID ####
+### Find projects that are tagged with the "GFCR" organization
+gfcrProjectsTBL <- mermaid_search_projects(tags = "GFCR",
+                                           include_test_projects = F)
+
+#Remove the one called "GFCR Secretariat Test", if it is there
+gfcrProjectsTBL <- gfcrProjectsTBL %>% 
+  filter(name != "GFCR Secretariat Test")
+
+### Get all data associated with these projects ####
+gfcrReportsTBL <- mermaid_get_gfcr_report(project = gfcrProjectsTBL)
+
+### Save a local copy of the data ####
+# Note that this will only be the current data on the date this code is run
+#   This will save in the folder above your working directory
+write.xlsx(x = gfcrReportsTBL,
+           file = "../AllGfcrReports.xlsx")
+```
+
+------------------------------------------------------------------------
+
+## Assign country data to GFCR projects
+
+The first step in assigning countries to GFCR project data is merging with the exported project information. The second step is to try to fill in missing information based on titles and notes for the projects. If any of the projects have missing countries or countries that don't match the list on the REEF+ Impact platform then a message is returned.
+
+```{r}
+#| label: Assign countries to projects with GFCR data
+gfcrProjectCountriesTBL <- gfcrProjectsTBL %>% 
+  select(name, countries, tags, notes) %>% 
+  rename(Project = name,
+         Country = countries,
+         ProjectTags = tags,
+         ProjectNotes = notes) %>% 
+  filter(Project %in% unique(gfcrReportsTBL$F1$Project)) #Only projects with data
+
+# Re-assign based on evidence in other columns and REEF+ Impact Beta
+#   Note - if these projects enter sites in MERMAID this would not be needed
+gfcrProjectCountriesTBL <- gfcrProjectCountriesTBL %>% 
+  mutate(Country =
+           case_when(Country %in% 
+                       c("Tanzania", "Kenya, Tanzania") ~
+                       "Kenya & Tanzania",
+                     Project == "BananaBay_Central_GFCR" ~
+                       "The Bahamas",
+                     Project == "Gulf of Aqaba Resilient Reefs Programme" ~
+                       "Egypt",
+                     Project == "MAR+Invest" ~
+                       "Mesoamerican Reef Region",
+                     Project == "Maldives RREEF (GFCR)" ~
+                       "Maldives",
+                     Project == "Sri Lanka Coral Reef Initiative _ GFCR" ~
+                       "Sri Lanka",
+                     Project == "OCEAN'S RESOLVE GFCR" ~
+                       "Seychelles",
+                     Project == "Micronesia GFCR Program" ~
+                       "Micronesia Region",
+                     Project == "KORALESTARI - Indonesia" ~
+                       "Indonesia",
+                     Project == "Fi Wi Riif - Colombia" ~
+                       "Colombia",
+                     Project == "Terumbu Karang Sehat Indonesia Program - Indonesia" ~
+                       "Indonesia",
+                     Project == "Impact Funding for BahamaReefs" ~
+                       "The Bahamas",
+                     .default = Country))
+
+# Return a message if any projects don't have valid country names
+validReefPlusCountries <- c("Brazil", "Colombia", "Egypt", "Fiji",
+                            "Indonesia", "Jordan", "Kenya & Tanzania",
+                            "Maldives", "Mesoamerican Reef Region",
+                            "Micronesia Region", "Papua New Guinea",
+                            "Philippines", "Seychelles", "Sri Lanka",
+                            "The Bahamas")
+
+if(any(!gfcrProjectCountriesTBL$Country %in% validReefPlusCountries)) {
+  invalidCountryTBL <- gfcrProjectCountriesTBL %>% 
+    filter(!Country %in% validReefPlusCountries)
+  
+  # Create a message string with project-country pairs, one per line
+  project_country_msg <- invalidCountryTBL %>%
+    mutate(line = paste0(Project, ": ", Country)) %>%
+    pull(line) %>%
+    paste(collapse = "\n")
+  
+  message("Countries for the following projects don't match REEF+:\n", 
+          project_country_msg)
+} else {
+  message("All projects have countries that match REEF+")
+}
+```
+
+------------------------------------------------------------------------
+
+## Visualize summaries of the data by project
+
+This code shows one way to determine how much data there is for each of the indicators by project. It also removes any projects without any report data as a quality check.
+
+```{r}
+#| label: Data summary visualizations
+
+### Summarize the data entered by project (number of rows per tab) ####
+# Get the labels for each of the sheet names (besides the metadata tab)
+sheet_names <- names(gfcrReportsTBL)[1:10]
+
+#Function to count rows by project
+count_by_project <- function(df, sheet_name) {
+  if ("Project" %in% names(df)) {
+    df %>%
+      count(Project) %>%
+      rename(!!sheet_name := n)
+  } else {
+    tibble(Project = character(), !!sheet_name := integer())
+  }
+}
+
+# Apply the function to each sheet in the list
+project_counts_list <- map2(gfcrReportsTBL[sheet_names],
+                            sheet_names,
+                            count_by_project)
+
+# Combine all the individual data frames into one summary table
+project_summary <- reduce(project_counts_list, full_join, by = "Project") %>%
+  replace(is.na(.), 0) %>%
+  arrange(Project)
+
+#View the summary table as a dynamic table
+datatable(project_summary, options = list(pageLength = 10, autoWidth = TRUE))
+
+## Create another table showing projects, #reports, #targets, and date ranges
+gfcrReportSummaryTBL <- gfcrReportsTBL$F1 %>% 
+  group_by(Project) %>% 
+  summarise(NumReports = sum(`Data Type` == "Report"),
+            NumTargets = sum(`Data Type` == "Target"),
+            YearRange =
+              ifelse(test = min(year(`Reporting Date`)) ==
+                       max(year(`Reporting Date`)),
+                     yes = as.character(min(year(`Reporting Date`))),
+                     no = paste0(min(year(`Reporting Date`)),
+                                 "-",
+                                 max(year(`Reporting Date`)))))
+
+#View the summary table
+kable(gfcrReportSummaryTBL) %>% kable_styling(full_width = F, position = "left") 
+
+#Return message if any have no reports and re-export without them
+if(any(gfcrReportSummaryTBL$NumReports == 0)) {
+  noReportProjects <- gfcrReportSummaryTBL %>% 
+    filter(NumReports == 0)
+  
+  # Create a message string with project-country pairs, one per line
+  project_noReport_msg <- noReportProjects %>%
+    mutate(line = Project) %>%
+    pull(line) %>%
+    paste(collapse = "\n")
+  
+  message("The following projects don't have any reports and will be removed:\n", 
+          project_noReport_msg)
+  
+  gfcrProjectsTBL <- gfcrProjectsTBL %>% 
+    filter(!name %in% noReportProjects$Project)
+  
+  ### Get all data associated with the reduced list of projects ####
+  gfcrReportsTBL <- mermaid_get_gfcr_report(project = gfcrProjectsTBL)
+  
+} else {
+  message("All projects have at least one report")
+}
+
+```
+
+------------------------------------------------------------------------
+
+## Area of coral reefs under improved management (ha)
+
+Data is needed for the area of coral reefs under improved management (GFCR Indicator F1) globally and for each country represented in the GFCR projects. Since the desired metric is in hectares and F1 is exported in square kilometers that will also need to be converted. To accomplish this, it will also be necessary to merge the country data into the exported data for F1.
+
+```{r}
+#| label: Aggregate indicator F1 - overall and by country
+coralReefAreaAggTBL <- gfcrReportsTBL$F1 %>% 
+  select(Project, Title, `Reporting Date`, `Data Type`, `Area (km2)`) %>% 
+  left_join(gfcrProjectCountriesTBL %>% select(Project, Country)) 
+```
