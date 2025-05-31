@@ -23,7 +23,7 @@ This code was created to make it easier to export GFCR data from MERMAID ([https
 
 ------------------------------------------------------------------------
 
-## Getting summary sample event data from MERMAID
+## Getting GFCR data from MERMAID
 
 The first step is to download all of the current GFCR data from MERMAID. This is done using the mermaidr package (<https://data-mermaid.github.io/mermaidr/>). That package must be installed and its library loaded. The following code also requires other packages - the libraries for those packages are loaded here but this code assumes the packages have already been installed.
 
