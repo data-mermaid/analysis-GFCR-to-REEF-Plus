@@ -43,6 +43,7 @@ library(tidyverse) #package that makes it easier to work with data
 library(openxlsx) #package for saving files as xlsx
 library(DT) #interactive tables
 library(kableExtra) #formatting of tables
+library(scales)
 
 #### Get current GFCR data from MERMAID ####
 ### Find projects that are tagged with the "GFCR" organization
@@ -58,9 +59,9 @@ gfcrReportsTBL <- mermaid_get_gfcr_report(project = gfcrProjectsTBL)
 
 ### Save a local copy of the data ####
 # Note that this will only be the current data on the date this code is run
-#   This will save in the folder above your working directory
+#   This will save in a folder called "data" outside your working directory
 write.xlsx(x = gfcrReportsTBL,
-           file = "../AllGfcrReports.xlsx")
+           file = "../data/AllGfcrReports.xlsx")
 ```
 
 ------------------------------------------------------------------------
@@ -224,5 +225,698 @@ Data is needed for the area of coral reefs under improved management (GFCR Indic
 #| label: Aggregate indicator F1 - overall and by country
 coralReefAreaAggTBL <- gfcrReportsTBL$F1 %>% 
   select(Project, Title, `Reporting Date`, `Data Type`, `Area (km2)`) %>% 
-  left_join(gfcrProjectCountriesTBL %>% select(Project, Country)) 
+  filter(Title != "Baseline Final") %>% #This title from Fiji is problematic
+  left_join(gfcrProjectCountriesTBL %>% select(Project, Country),
+            by = "Project") %>%
+  mutate(`Reporting Date` = as.Date(`Reporting Date`)) %>%
+  arrange(`Reporting Date`) %>%
+  group_by(Project, `Data Type`) %>%
+  slice_tail(n = 1) %>%
+  ungroup()
+
+# Identify projects missing "Target"
+projects_missing_target <- coralReefAreaAggTBL %>%
+  group_by(Project) %>%
+  summarize(has_target = any(`Data Type` == "Target"),
+            has_report = any(`Data Type` == "Report")) %>%
+  filter(!has_target & has_report) %>%
+  pull(Project)
+
+if(length(projects_missing_target) > 0) {
+  message("Missing targets for these projects are replaced with latest report:\n", 
+          paste(projects_missing_target, collapse = "\n"))
+}
+
+# Use group_modify to fill missing Targets
+coralReefAreaAggTBL <- coralReefAreaAggTBL %>%
+  group_by(Project) %>%
+  group_modify(~ {
+    data <- .
+    if (!"Target" %in% data$`Data Type`) {
+      # Add Target row if missing
+      report_row <- filter(data, `Data Type` == "Report")
+      target_row <- mutate(report_row, `Data Type` = "Target")
+      data <- bind_rows(data, target_row)
+    }
+    # Get values for comparison
+    report_value <- data %>% filter(`Data Type` == "Report") %>% pull(`Area (km2)`)
+    target_value <- data %>% filter(`Data Type` == "Target") %>% pull(`Area (km2)`)
+    
+    # If report > target, update target value to report
+    if(length(report_value) > 0 &&
+       length(target_value) > 0 &&
+       report_value > target_value) {
+      data <- data %>%
+        mutate(`Area (km2)` = ifelse(`Data Type` == "Target",
+                                     report_value, `Area (km2)`))
+    }
+    data
+  }) %>%
+  ungroup() %>%
+  arrange(Project, `Data Type`)
+
+#Convert km2 to hectares and simplify data
+coralReefAreaAggTBL <- coralReefAreaAggTBL %>%
+  mutate(`Area (hectares)` = `Area (km2)` * 100) %>%
+  select(-`Area (km2)`)
+
+#Summarize directly by Country and Data Type (Report/Target)
+coralReefAreaByCountry <- coralReefAreaAggTBL %>%
+  group_by(Country, `Data Type`) %>%
+  summarize(
+    Total_Area = sum(`Area (hectares)`, na.rm = TRUE),
+    Reporting_Dates = paste(unique(`Reporting Date`), collapse = "; "),
+    Titles = paste(unique(Title), collapse = "; "),
+    .groups = "drop"
+  ) %>%
+  pivot_wider(
+    names_from = `Data Type`,
+    values_from = c(Total_Area, Reporting_Dates, Titles),
+    names_sep = "_"
+  )
+
+#Create a Global summary row
+global_summary <- coralReefAreaAggTBL %>%
+  group_by(`Data Type`) %>%
+  summarize(
+    Country = "Global",
+    Total_Area = sum(`Area (hectares)`, na.rm = TRUE),
+    Reporting_Dates = paste(unique(`Reporting Date`), collapse = "; "),
+    Titles = paste(unique(Title), collapse = "; "),
+    .groups = "drop"
+  ) %>%
+  pivot_wider(
+    names_from = `Data Type`,
+    values_from = c(Total_Area, Reporting_Dates, Titles),
+    names_sep = "_"
+  )
+
+#Combine country and global summaries
+coralReefAreaFinal <- bind_rows(coralReefAreaByCountry, global_summary) %>% 
+  rename(`Coral reef area under improved management (F1) - Target` =
+           Total_Area_Target,
+         `Coral reef area under improved management (F1) - Secured` =
+           Total_Area_Report,
+         `Reporting dates (F1) - Target` = Reporting_Dates_Target,
+         `Reporting dates (F1) - Secured` = Reporting_Dates_Report,
+         `Titles (F1) - Target` = Titles_Target,
+         `Titles (F1) - Secured` = Titles_Report)
+
+#Show as an interactive table
+datatable(coralReefAreaFinal, options = list(pageLength = 10, autoWidth = TRUE))
+```
+
+------------------------------------------------------------------------
+
+## Protected areas with sustainable financing support (ha)
+
+Data is also needed for globally and for each country represented in the GFCR projects for the total of protected areas with sustainable financing support - calculated as the sum of F2.1b and F2.2b. As above, these values will need to be converted to hectares and the country data needs to be merged into the F2 data.
+
+```{r}
+#| label: Aggregate indicator F2.1b and F2.2b - overall and by country
+protectedAreaAggTBL <- gfcrReportsTBL$F2 %>% 
+  filter(Title != "Baseline Final") %>% #This title from Fiji is problematic
+  filter(grepl(pattern = "F2.1b|F2.2b", x = `Sub-Indicator Name`)) %>% 
+  group_by(Project, Title, `Reporting Date`, `Data Type`) %>% 
+  dplyr::summarize(`Area (hectares)` = sum(`Area (km2)`) * 100) %>%
+  left_join(gfcrProjectCountriesTBL %>% select(Project, Country),
+            by = "Project") %>%
+  mutate(`Reporting Date` = as.Date(`Reporting Date`)) %>%
+  arrange(`Reporting Date`) %>%
+  group_by(Project, `Data Type`) %>%
+  dplyr::slice_tail(n = 1) %>%
+  ungroup()
+
+# Identify projects missing "Target"
+projects_missing_target <- protectedAreaAggTBL %>%
+  group_by(Project) %>%
+  summarize(has_target = any(`Data Type` == "Target"),
+            has_report = any(`Data Type` == "Report")) %>%
+  filter(!has_target & has_report) %>%
+  pull(Project)
+
+if(length(projects_missing_target) > 0) {
+  message("Missing targets for these projects are replaced with latest report:\n", 
+          paste(projects_missing_target, collapse = "\n"))
+}
+
+# Use group_modify to fill missing Targets
+protectedAreaAggTBL <- protectedAreaAggTBL %>%
+  group_by(Project) %>%
+  group_modify(~ {
+    data <- .
+    # Check for missing Target row and fill
+    if (!"Target" %in% data$`Data Type`) {
+      report_row <- filter(data, `Data Type` == "Report")
+      target_row <- mutate(report_row, `Data Type` = "Target")
+      data <- bind_rows(data, target_row)
+    }
+    # Extract values for comparison
+    report_value <- data %>% filter(`Data Type` == "Report") %>%
+      pull(`Area (hectares)`)
+    target_value <- data %>% filter(`Data Type` == "Target") %>%
+      pull(`Area (hectares)`)
+    
+    # If Report > Target, update Target value to Report
+    if(length(report_value) > 0 &&
+       length(target_value) > 0 &&
+       report_value > target_value) {
+      data <- data %>%
+        mutate(`Area (hectares)` = ifelse(`Data Type` == "Target",
+                                          report_value, `Area (hectares)`))}
+    data}) %>%
+  ungroup() %>%
+  arrange(Project, `Data Type`)
+
+#Summarize directly by Country and Data Type (Report/Target)
+protectedAreaByCountry <- protectedAreaAggTBL %>%
+  group_by(Country, `Data Type`) %>%
+  summarize(
+    Total_Area = sum(`Area (hectares)`, na.rm = TRUE),
+    Reporting_Dates = paste(unique(`Reporting Date`), collapse = "; "),
+    Titles = paste(unique(Title), collapse = "; "),
+    .groups = "drop"
+  ) %>%
+  pivot_wider(
+    names_from = `Data Type`,
+    values_from = c(Total_Area, Reporting_Dates, Titles),
+    names_sep = "_"
+  )
+
+#Create a Global summary row
+global_summary <- protectedAreaAggTBL %>%
+  group_by(`Data Type`) %>%
+  summarize(
+    Country = "Global",
+    Total_Area = sum(`Area (hectares)`, na.rm = TRUE),
+    Reporting_Dates = paste(unique(`Reporting Date`), collapse = "; "),
+    Titles = paste(unique(Title), collapse = "; "),
+    .groups = "drop"
+  ) %>%
+  pivot_wider(
+    names_from = `Data Type`,
+    values_from = c(Total_Area, Reporting_Dates, Titles),
+    names_sep = "_"
+  )
+
+#Combine country and global summaries
+protectedAreaFinal <- bind_rows(protectedAreaByCountry, global_summary) %>% 
+  rename(`Protected area with sustainable financing support (F2.1 + F2.2) - Target` = Total_Area_Target,
+         `Protected area with sustainable financing support (F2.1 + F2.2) - Secured` = Total_Area_Report,
+         `Reporting dates (F2) - Target` = Reporting_Dates_Target,
+         `Reporting dates (F2) - Secured` = Reporting_Dates_Report,
+         `Titles (F2) - Target` = Titles_Target,
+         `Titles (F2) - Secured` = Titles_Report)
+
+#Show as an interactive table
+datatable(protectedAreaFinal, options = list(pageLength = 10, autoWidth = TRUE))
+
+```
+
+------------------------------------------------------------------------
+
+## Directly supported reef-positive jobs
+
+The data for these numbers comes from GFCR Indicator F6.1. The following shows how to aggregate those numbers by country and overall (globally) for the most recently reported data.
+
+```{r}
+#| label: Aggregate indicator F6.1 - overall and by country
+#| warning: false
+directJobsAggTBL <- gfcrReportsTBL$F6 %>% 
+  filter(Title != "Baseline Final") %>% #This title from Fiji is problematic
+  filter(grepl(pattern = "F6.1a|F6.1b", x = `Sub-Indicator Name`) &
+           `Data Type` == "Report") %>% 
+  group_by(Project, Title, `Reporting Date`) %>% 
+  dplyr::summarize(NumDirectJobs = sum(Value)) %>%
+  left_join(gfcrProjectCountriesTBL %>% select(Project, Country),
+            by = "Project") %>%
+  mutate(`Reporting Date` = as.Date(`Reporting Date`)) %>%
+  arrange(`Reporting Date`) %>%
+  group_by(Project) %>%
+  dplyr::slice_tail(n = 1) %>%
+  ungroup()
+
+#Summarize by country
+directJobsByCountry <- directJobsAggTBL %>%
+  group_by(Country) %>%
+  summarize(
+    Total_Jobs = sum(NumDirectJobs, na.rm = TRUE),
+    Reporting_Dates = paste(unique(`Reporting Date`), collapse = "; "),
+    Titles = paste(unique(Title), collapse = "; "),
+    .groups = "drop")
+
+#Create a Global summary row
+globalDirJobs <- directJobsAggTBL %>%
+  summarize(
+    Country = "Global",
+    Total_Jobs = sum(NumDirectJobs, na.rm = TRUE),
+    Reporting_Dates = paste(unique(`Reporting Date`), collapse = "; "),
+    Titles = paste(unique(Title), collapse = "; "),
+    .groups = "drop")
+
+#Combine country and global summaries
+directJobsFinal <- bind_rows(directJobsByCountry, globalDirJobs) %>% 
+  rename(`# directly supported reef-positive jobs (F6.1)` = Total_Jobs,
+         `Reporting dates (F6.1)` = Reporting_Dates,
+         `Titles (F6.1)` = Titles)
+
+#Show as an interactive table
+datatable(directJobsFinal, options = list(pageLength = 10, autoWidth = TRUE))
+```
+
+------------------------------------------------------------------------
+
+## Community members with increased resilience
+
+These numbers are extracted from GFCR indicator F7.2 - total indirect beneficiaries. The following shows how to aggregate those numbers by country and globally for the most recently reported data.
+
+```{r}
+#| label: Aggregate indicator F7.2 - overall and by country
+#| warning: false
+indirectBenAggTBL <- gfcrReportsTBL$F7 %>% 
+  filter(Title != "Baseline Final") %>% #This title from Fiji is problematic
+  filter(grepl(pattern = "F7.2a|F7.2b", x = `Sub-Indicator Name`) &
+           `Data Type` == "Report") %>% 
+  group_by(Project, Title, `Reporting Date`) %>% 
+  dplyr::summarize(NumIndirectBen = sum(Value)) %>%
+  left_join(gfcrProjectCountriesTBL %>% select(Project, Country),
+            by = "Project") %>%
+  mutate(`Reporting Date` = as.Date(`Reporting Date`)) %>%
+  arrange(`Reporting Date`) %>%
+  group_by(Project) %>%
+  dplyr::slice_tail(n = 1) %>%
+  ungroup()
+
+#Summarize by country
+indirectBenByCountry <- indirectBenAggTBL %>%
+  group_by(Country) %>%
+  summarize(
+    Total_IndBen = sum(NumIndirectBen, na.rm = TRUE),
+    Reporting_Dates = paste(unique(`Reporting Date`), collapse = "; "),
+    Titles = paste(unique(Title), collapse = "; "),
+    .groups = "drop")
+
+#Create a Global summary row
+globalIndirBen <- indirectBenAggTBL %>%
+  summarize(
+    Country = "Global",
+    Total_IndBen = sum(NumIndirectBen, na.rm = TRUE),
+    Reporting_Dates = paste(unique(`Reporting Date`), collapse = "; "),
+    Titles = paste(unique(Title), collapse = "; "),
+    .groups = "drop")
+
+#Combine country and global summaries
+indirectBenFinal <- bind_rows(indirectBenByCountry, globalIndirBen) %>% 
+  rename(`# community members with increased resilience (F7.2)` = Total_IndBen,
+         `Reporting dates (F7.2)` = Reporting_Dates,
+         `Titles (F7.2)` = Titles)
+
+#Show as an interactive table
+datatable(indirectBenFinal, options = list(pageLength = 10, autoWidth = TRUE))
+```
+
+------------------------------------------------------------------------
+
+## Combine data by country for F1, F2.1 + F2.2, F6.1, and F7.2
+
+Create and save a single CSV with the aggregated data by country and globally.
+
+```{r}
+#| label: Combine data aggregated by country and save as CSV
+#| warning: false
+areaPeopleAggByCountryTBL <- coralReefAreaFinal %>% 
+  full_join(protectedAreaFinal, by = "Country") %>% 
+  full_join(directJobsFinal, by = "Country") %>% 
+  full_join(indirectBenFinal, by = "Country") 
+
+write_csv(x = areaPeopleAggByCountryTBL,
+          file = "../data/GFCR_AreasPeople_AggByCountry.csv")
+```
+
+------------------------------------------------------------------------
+
+## Reef-positive solutions by country and sector
+
+Counts of the numbers of reef positive solutions (i.e. businesses and finance mechanisms) by country (and globally) and by sector. This code assumes that real businesses and finance solutions are only found in "Reports" whereas "Targets" are those that may be planned but not implemented.
+
+```{r}
+#| label: Count reef-positive solutions by country and sector
+#### Aggregate by country ####
+reefPosSolAggByCountry <- gfcrReportsTBL$BusinessesFinanceSolutions %>% 
+  filter(`Data Type` == "Report") %>% 
+  group_by(Project) %>% 
+  summarise(NumReefPosSolutions =
+              length(unique(`Business / Finance Solution`))) %>% 
+  ungroup() %>% 
+  left_join(gfcrProjectCountriesTBL %>% select(Project, Country),
+            by = "Project") %>%
+  group_by(Country) %>% 
+  summarise(NumReefPosSolutions = sum(NumReefPosSolutions)) %>% 
+  ungroup() 
+
+reefPosSolAggGlobal <-
+  tibble(Country = "Global",
+         NumReefPosSolutions = sum(reefPosSolAggByCountry$NumReefPosSolutions))
+
+reefPosSolAggByCountry <- reefPosSolAggByCountry %>% 
+  bind_rows(reefPosSolAggGlobal)
+
+#Show as an interactive table
+datatable(reefPosSolAggByCountry,
+          options = list(pageLength = 10, autoWidth = TRUE))
+
+#### Aggregate by sector ####
+reefPosSolAggBySector <- gfcrReportsTBL$BusinessesFinanceSolutions %>% 
+  filter(`Data Type` == "Report") %>% 
+  group_by(Sector) %>% 
+  summarise(NumReefPosSolutions =
+              length(unique(`Business / Finance Solution`))) %>% 
+  ungroup() 
+
+#Show as an interactive table
+datatable(reefPosSolAggBySector,
+          options = list(pageLength = 10, autoWidth = TRUE))
+```
+
+------------------------------------------------------------------------
+
+## Sectors by country
+
+Get the percentages of each sector by country and overall (global). Turn each of the sectors into columns.
+
+```{r}
+#| label: Get percentages for each sector represented by businesses in countries
+sectorPercByCountry <- gfcrReportsTBL$BusinessesFinanceSolutions %>% 
+  filter(`Data Type` == "Report") %>% 
+  select(Project, `Business / Finance Solution`, Sector) %>% 
+  distinct() %>% 
+  left_join(gfcrProjectCountriesTBL %>% select(Project, Country),
+            by = "Project") %>%
+  group_by(Country) %>%
+  mutate(TotalBusinesses = n_distinct(`Business / Finance Solution`)) %>%  
+  group_by(Country, Sector) %>%
+  summarise(
+    SectorBusinesses = n_distinct(`Business / Finance Solution`),
+    TotalBusinesses = first(TotalBusinesses),
+    .groups = "drop"
+  ) %>%
+  mutate(Percent = (SectorBusinesses / TotalBusinesses) * 100) %>%
+  select(Country, Sector, Percent) %>%
+  pivot_wider(names_from = Sector, values_from = Percent, values_fill = 0)
+
+# Calculate global sector percentages
+sectorPercGlobal <- gfcrReportsTBL$BusinessesFinanceSolutions %>% 
+  filter(`Data Type` == "Report") %>% 
+  select(Project, `Business / Finance Solution`, Sector) %>% 
+  distinct() 
+
+TotalBusinesses = n_distinct(sectorPercGlobal$`Business / Finance Solution`)
+
+sectorPercGlobal <- sectorPercGlobal %>% 
+  group_by(Sector) %>% 
+  dplyr::summarise(SectorBusinesses =
+                     n_distinct(`Business / Finance Solution`)) %>% 
+  mutate(Percent = (SectorBusinesses / TotalBusinesses) * 100) %>% 
+  select(Sector, Percent) %>%
+  pivot_wider(names_from = Sector, values_from = Percent, values_fill = 0) %>%
+  mutate(Country = "Global") %>%
+  select(Country, everything())
+
+# Combine country and global summaries
+sectorPercByCountry <- bind_rows(sectorPercByCountry, sectorPercGlobal)
+
+#Show as an interactive table
+datatable(sectorPercByCountry,
+          options = list(pageLength = 10, autoWidth = TRUE))
+```
+
+------------------------------------------------------------------------
+
+## Countries by sector
+
+Similarly, get the percentages of each country by sector, turning each country into a column
+
+```{r}
+#| label: Get percentages for each country represented by businesses in sectors
+countryPercBySector <- gfcrReportsTBL$BusinessesFinanceSolutions %>% 
+  filter(`Data Type` == "Report") %>% 
+  select(Project, `Business / Finance Solution`, Sector) %>% 
+  distinct() %>% 
+  left_join(gfcrProjectCountriesTBL %>% select(Project, Country),
+            by = "Project") %>%
+  group_by(Sector) %>%
+  mutate(TotalBusinesses = n_distinct(`Business / Finance Solution`)) %>%  
+  group_by(Country, Sector) %>%
+  summarise(
+    CountryBusinesses = n_distinct(`Business / Finance Solution`),
+    TotalBusinesses = first(TotalBusinesses),
+    .groups = "drop"
+  ) %>%
+  mutate(Percent = (CountryBusinesses / TotalBusinesses) * 100) %>%
+  select(Country, Sector, Percent) %>%
+  pivot_wider(names_from = Country, values_from = Percent, values_fill = 0)
+
+#Show as an interactive table
+datatable(countryPercBySector,
+          options = list(pageLength = 10, autoWidth = TRUE))
+```
+
+------------------------------------------------------------------------
+
+## Achieved investments by country and source
+
+The following shows how to calculate the total investments by country and globally for each investment source (GFCR, private, public, philanthropy).
+
+```{r}
+#| label: Calculate total investments by country and investment source
+investmentsByCountrySource <- gfcrReportsTBL$Investments %>% 
+  filter(`Data Type` == "Report") %>% 
+  mutate(`Reporting Date` = as.Date(`Reporting Date`)) %>%
+  arrange(`Reporting Date`) %>%
+  group_by(Project, `Business / Finance Solution`,
+           `Sustainable Finance Mechanisms`,
+           Sector, `Investment Source`, `Investment Type`) %>%
+  slice_tail(n = 1) %>%
+  ungroup() %>% 
+  left_join(gfcrProjectCountriesTBL %>% select(Project, Country),
+            by = "Project")
+
+investmentsGlobalBySource <- investmentsByCountrySource %>%
+  group_by(`Investment Source`) %>%
+  summarise(TotalInvestment = sum(`Investment Amount`, na.rm = TRUE),
+            .groups = "drop") %>%
+  pivot_wider(names_from = `Investment Source`,
+              values_from = TotalInvestment,
+              names_prefix = "Investments_",
+              values_fill = 0) %>%
+  mutate(Country = "Global") %>%
+  select(Country, everything())
+
+investmentsByCountrySource <- investmentsByCountrySource %>% 
+  group_by(Country, `Investment Source`) %>% 
+  summarise(TotalInvestment = sum(`Investment Amount`, na.rm = T),
+            .groups = "drop") %>% 
+  pivot_wider(names_from = `Investment Source`,
+              values_from = TotalInvestment,
+              names_prefix = "Investments_",
+              values_fill = 0) %>% 
+  bind_rows(investmentsGlobalBySource) %>% 
+  mutate(Investments_Total = Investments_GFCR +
+           Investments_Private +
+           Investments_Philanthropy +
+           Investments_Public)
+
+#Show as an interactive table
+datatable(investmentsByCountrySource,
+          options = list(pageLength = 10, autoWidth = TRUE))
+```
+
+------------------------------------------------------------------------
+
+## Achieved investments by sector and source
+
+Similar to above, this code shows how to calculate investments by sector for each investment source
+
+```{r}
+#| label: Calculate total investments by sector and investment source
+investmentsBySectorSource <- gfcrReportsTBL$Investments %>% 
+  filter(`Data Type` == "Report") %>% 
+  mutate(`Reporting Date` = as.Date(`Reporting Date`)) %>%
+  arrange(`Reporting Date`) %>%
+  group_by(Project, `Business / Finance Solution`,
+           `Sustainable Finance Mechanisms`,
+           Sector, `Investment Source`, `Investment Type`) %>%
+  slice_tail(n = 1) %>%
+  ungroup() %>% 
+  group_by(Sector, `Investment Source`) %>% 
+  summarise(TotalInvestment = sum(`Investment Amount`, na.rm = T),
+            .groups = "drop") %>% 
+  pivot_wider(names_from = `Investment Source`,
+              values_from = TotalInvestment,
+              names_prefix = "Investments_",
+              values_fill = 0) %>% 
+  mutate(Investments_Total = Investments_GFCR +
+           Investments_Private +
+           Investments_Philanthropy +
+           Investments_Public)
+
+#Show as an interactive table
+datatable(investmentsBySectorSource,
+          options = list(pageLength = 10, autoWidth = TRUE))
+```
+
+------------------------------------------------------------------------
+
+## Achieved total revenue - country
+
+The following calculates the total revenue for each country and globally.
+
+```{r}
+#| label: Calculate total revenue by country
+revenueByCountry <- gfcrReportsTBL$Revenues %>% 
+  filter(`Data Type` == "Report") %>% 
+  mutate(`Reporting Date` = as.Date(`Reporting Date`)) %>%
+  arrange(`Reporting Date`) %>%
+  group_by(Project, `Business / Finance Solution`,
+           `Sustainable Finance Mechanisms`,
+           Sector, `Revenue Type`, `Sustainable Revenue Source`) %>%
+  slice_tail(n = 1) %>%
+  ungroup() %>% 
+  left_join(gfcrProjectCountriesTBL %>% select(Project, Country),
+            by = "Project")
+
+revenueGlobal <- revenueByCountry %>%
+  summarise(TotalRevenue = sum(`Revenue Amount`, na.rm = TRUE),
+            .groups = "drop") %>% 
+  mutate(Country = "Global") %>%
+  select(Country, everything())
+
+revenueByCountry <- revenueByCountry %>% 
+  group_by(Country) %>% 
+  summarise(TotalRevenue = sum(`Revenue Amount`, na.rm = TRUE),
+            .groups = "drop") %>% 
+  bind_rows(revenueGlobal)
+
+#Show as an interactive table
+datatable(revenueByCountry,
+          options = list(pageLength = 10, autoWidth = TRUE))
+
+```
+
+------------------------------------------------------------------------
+
+## Achieved total revenue - sector
+
+The following calculated total review by sector
+
+```{r}
+#| label: Calculate total revenue by sector
+revenueBySector <- gfcrReportsTBL$Revenues %>% 
+  filter(`Data Type` == "Report") %>% 
+  mutate(`Reporting Date` = as.Date(`Reporting Date`)) %>%
+  arrange(`Reporting Date`) %>%
+  group_by(Project, `Business / Finance Solution`,
+           `Sustainable Finance Mechanisms`,
+           Sector, `Revenue Type`, `Sustainable Revenue Source`) %>%
+  slice_tail(n = 1) %>%
+  ungroup() %>% 
+  group_by(Sector) %>% 
+  summarise(TotalRevenue = sum(`Revenue Amount`, na.rm = TRUE),
+            .groups = "drop")
+
+#Show as an interactive table
+datatable(revenueBySector,
+          options = list(pageLength = 10, autoWidth = TRUE))
+```
+
+------------------------------------------------------------------------
+
+## Gender positive investments - by country and sector
+
+Count of the number of gender-positive businesses that have investments by country and globally.
+
+```{r}
+#| label: Count of gender positive investments by country
+
+genderPosBusinesses <- gfcrReportsTBL$BusinessesFinanceSolutions %>% 
+  filter(`Data Type` == "Report") %>% 
+  filter(`Gender Smart Investment` == "Yes") %>% 
+  select(Project, `Business / Finance Solution`, `Gender Smart Investment`) %>% 
+  distinct()
+
+genderPosInvestments <- gfcrReportsTBL$Investments %>% 
+  filter(`Data Type` == "Report" & `Investment Amount` > 0) %>% 
+  left_join(genderPosBusinesses) %>% 
+  select(Project, `Business / Finance Solution`, Sector,
+         `Gender Smart Investment`) %>% 
+  distinct() %>% 
+  left_join(gfcrProjectCountriesTBL %>% select(Project, Country),
+            by = "Project")
+
+genderPosInvestmentsByCountry <- genderPosInvestments %>% 
+  group_by(Country) %>% 
+  summarise(`Number of Gender Positive Investments` =
+              n_distinct(`Business / Finance Solution`)) %>% 
+  ungroup() 
+
+genderPosInvestmentsGlobal <-
+  tibble(Country = "Global",
+         `Number of Gender Positive Investments` =
+           sum(genderPosInvestmentsByCountry$`Number of Gender Positive Investments`))
+
+genderPosInvestmentsByCountry <- genderPosInvestmentsByCountry %>% 
+  bind_rows(genderPosInvestmentsGlobal)
+  
+#Show as an interactive table
+datatable(genderPosInvestmentsByCountry,
+          options = list(pageLength = 10, autoWidth = TRUE))
+
+genderPosInvestmentsBySector <- genderPosInvestments %>% 
+  group_by(Sector) %>% 
+  summarise(`Number of Gender Positive Investments` =
+              n_distinct(`Business / Finance Solution`)) %>% 
+  ungroup() 
+  
+#Show as an interactive table
+datatable(genderPosInvestmentsBySector,
+          options = list(pageLength = 10, autoWidth = TRUE))
+
+```
+
+------------------------------------------------------------------------
+
+## Combine financial metrics by country and save
+
+Merge and then save all of the financial metrics that were aggregated by country
+
+```{r}
+#| label: Merge the financial metrics by country then save as CSV
+financeByCountryTBL <- reefPosSolAggByCountry %>% 
+  full_join(sectorPercByCountry, by = "Country") %>% 
+  full_join(investmentsByCountrySource, by = "Country") %>% 
+  full_join(revenueByCountry, by = "Country") %>% 
+  full_join(genderPosInvestmentsByCountry, by = "Country") %>% 
+  mutate(across(everything(), ~replace_na(., 0)))
+
+write_csv(x = financeByCountryTBL,
+          file = "../data/GFCR_ReefPlus_Finance_AggByCountry.csv")
+```
+
+------------------------------------------------------------------------
+
+## Combine financial metrics by sector and save
+
+Merge and then save all of the financial metrics that were aggregated by sector
+
+```{r}
+#| label: Merge the financial metrics by sector then save as CSV
+financeBySectorTBL <- reefPosSolAggBySector %>% 
+  full_join(countryPercBySector, by = "Sector") %>% 
+  full_join(investmentsBySectorSource, by = "Sector") %>% 
+  full_join(revenueBySector, by = "Sector") %>% 
+  full_join(genderPosInvestmentsBySector, by = "Sector") %>% 
+  mutate(across(everything(), ~replace_na(., 0)))
+
+write_csv(x = financeBySectorTBL,
+          file = "../data/GFCR_ReefPlus_Finance_AggBySector.csv")
 ```
